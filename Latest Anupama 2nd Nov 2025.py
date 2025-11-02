@@ -3,18 +3,74 @@ from datetime import datetime, timedelta, date
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-import dhan_broker
 import pytz
-
-# FYI: Use your dhan client as dhan. Import/setup your dhan client separately.
-# from dhanhq import dhanhq
-# dhan = dhanhq(client_id=..., access_token=...)
+from dhanhq import dhanhq
 
 # ---------- CONFIG ----------
+# --- Dhan Credentials ---
+DHAN_CLIENT_ID = "YOUR_CLIENT_ID"  # Replace with your Dhan Client ID
+DHAN_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"  # Replace with your Dhan Access Token
+
+# --- Google Sheets ---
 SERVICE_ACCOUNT_FILE = "/Users/admin/Downloads/python_project/stocksdetailsalgosheet-74173c3a8b69.json"  # uploaded credentials.
 SHEET_NAME = "SupportBreakers"   # change if you want another sheet name
+
+# --- Script Parameters ---
 CSV_SYMBOLS = "ind_nifty500list.csv"
 MAX_LOSERS = 50
+
+# ---------- Dhan Broker Functions ----------
+def get_instrument_df():
+    """
+    Downloads the instrument list from Dhan and returns it as a Pandas DataFrame.
+    """
+    try:
+        df = pd.read_csv("https://images.dhan.co/api-data/api-scrip-master.csv")
+        return df
+    except Exception as e:
+        print(f"Error downloading instrument list: {e}")
+        return None
+
+def get_security_id(instrument_df, symbol, exchange_segment="NSE_EQ"):
+    """
+    Gets the security ID for a given symbol from the instrument DataFrame.
+    """
+    if instrument_df is None:
+        return None
+    try:
+        security_id = instrument_df[
+            (instrument_df['SEM_TRADING_SYMBOL'] == symbol) &
+            (instrument_df['SEM_EXCH_ID'] == exchange_segment)
+        ]['SEM_SMST_SECURITY_ID'].iloc[0]
+        return str(security_id)
+    except IndexError:
+        return None
+
+def fetch_historical_daily_dhan(dhan_client, security_id, exchange_segment, from_date, to_date):
+    """
+    Fetches daily historical data from the Dhan API.
+    """
+    return dhan_client.historical_daily_data(
+        security_id=security_id,
+        exchange_segment=exchange_segment,
+        instrument_type='EQUITY',
+        expiry_code=0,
+        from_date=from_date,
+        to_date=to_date
+    )
+
+def fetch_historical_intraday_dhan(dhan_client, security_id, exchange_segment, from_date, to_date, interval="5"):
+    """
+    Fetches intraday historical data from the Dhan API.
+    """
+    return dhan_client.intraday_daily_minute_charts(
+        security_id=security_id,
+        exchange_segment=exchange_segment,
+        instrument_type='EQUITY',
+        expiry_code=0,
+        from_date=from_date,
+        to_date=to_date
+    )
 
 # ---------- Google Sheets auth ----------
 def gsheets_client():
@@ -56,16 +112,16 @@ def progress(i, total):
 # ---------- Fetch wrapper (Dhan) ----------
 def fetch_history(dhan_client, instrument_df, symbol, resolution, start_date, end_date):
     """
-    Wrapper to call dhan_broker functions.
+    Wrapper to call dhan broker functions.
     """
-    security_id = dhan_broker.get_security_id(instrument_df, symbol)
+    security_id = get_security_id(instrument_df, symbol)
     if not security_id:
         return None
 
     if resolution == "D":
-        response = dhan_broker.fetch_historical_daily(dhan_client, security_id, 'NSE_EQ', start_date, end_date)
+        response = fetch_historical_daily_dhan(dhan_client, security_id, 'NSE_EQ', start_date, end_date)
     else:
-        response = dhan_broker.fetch_historical_intraday(dhan_client, security_id, 'NSE_EQ', start_date, end_date, resolution)
+        response = fetch_historical_intraday_dhan(dhan_client, security_id, 'NSE_EQ', start_date, end_date, resolution)
 
     if not response or response.get('status') != 'success':
         return None
@@ -94,7 +150,8 @@ def fetch_history(dhan_client, instrument_df, symbol, resolution, start_date, en
 # ---------- Step 1: top N losers based on first 5-min candle (09:15 close) ----------
 def get_top_n_losers_first5(dhan_client, instrument_df, symbols, n=MAX_LOSERS):
     #today = date.today()
-    today = "2025-10-31"
+    today_str = "2025-10-31"
+    today = datetime.strptime(today_str, "%Y-%m-%d").date()
     prev_from = "2025-10-27"
     losers = []
     total = len(symbols)
@@ -107,7 +164,7 @@ def get_top_n_losers_first5(dhan_client, instrument_df, symbols, n=MAX_LOSERS):
         try:
             # get 5-min intraday for today
 
-            intraday_df = fetch_history(dhan_client, instrument_df, sym, "5", today, today)
+            intraday_df = fetch_history(dhan_client, instrument_df, sym, "5", today_str, today_str)
             if intraday_df is None:
                 continue
 
@@ -120,7 +177,7 @@ def get_top_n_losers_first5(dhan_client, instrument_df, symbols, n=MAX_LOSERS):
             # previous day close: fetch daily for prev two days to be safe
             # prev_from = today - timedelta(days=5).strftime("%Y-%m-%d")
 
-            prev_df = fetch_history(dhan_client, instrument_df, sym, "D", prev_from, today)
+            prev_df = fetch_history(dhan_client, instrument_df, sym, "D", prev_from, today_str)
             if prev_df is None:
                 continue
             #print("prev_df", prev_df)
@@ -145,7 +202,8 @@ def get_top_n_losers_first5(dhan_client, instrument_df, symbols, n=MAX_LOSERS):
 def analyze_and_build_rows(dhan_client, instrument_df, df_losers, symbols_df):
     out_rows = []
     #today = date.today().strftime("%Y-%m-%d")
-    today = "2025-10-31"
+    today_str = "2025-10-31"
+    today = datetime.strptime(today_str, "%Y-%m-%d").date()
     dstart = "2025-10-27"
     total = len(df_losers)
     for i, r in enumerate(df_losers.itertuples(), 1):
@@ -154,7 +212,7 @@ def analyze_and_build_rows(dhan_client, instrument_df, df_losers, symbols_df):
         try:
             # daily history for previous day OHLC and weekly context
             #dstart = today - timedelta(days=20).strftime("%Y-%m-%d")
-            ddf = fetch_history(dhan_client, instrument_df, sym, "D", dstart, today)
+            ddf = fetch_history(dhan_client, instrument_df, sym, "D", dstart, today_str)
             if ddf is None or len(ddf) < 2:
                 continue
 
@@ -189,7 +247,7 @@ def analyze_and_build_rows(dhan_client, instrument_df, df_losers, symbols_df):
             # intraday 5-min to get first candle
 
             #intr = fetch_history(dhan_client, instrument_df, sym, "5", "2025-10-31", "2025-10-31")
-            intraday_df = fetch_history(dhan_client, instrument_df, sym, "5", today, today)
+            intraday_df = fetch_history(dhan_client, instrument_df, sym, "5", today_str, today_str)
             if intraday_df is None:
                 continue
 
@@ -290,7 +348,7 @@ def write_to_sheet(rows):
 # ---------- MAIN ----------
 def main(dhan_client):
 
-    instrument_df = dhan_broker.get_instrument_df()
+    instrument_df = get_instrument_df()
     if instrument_df is None:
         print("Failed to load instrument list. Exiting.")
         return
@@ -318,8 +376,9 @@ def main(dhan_client):
     write_to_sheet(rows)
 
 # ---------- End script ----------
-# To run: initialize your dhan client and call main(dhan_client)
-# Example:
-# from dhanhq import dhanhq
-# dhan_client = dhanhq(client_id=..., access_token=...)
-# main(dhan_client)
+if __name__ == "__main__":
+    if DHAN_CLIENT_ID == "YOUR_CLIENT_ID" or DHAN_ACCESS_TOKEN == "YOUR_ACCESS_TOKEN":
+        print("Please replace 'YOUR_CLIENT_ID' and 'YOUR_ACCESS_TOKEN' with your actual Dhan credentials.")
+    else:
+        dhan_client = dhanhq(client_id=DHAN_CLIENT_ID, access_token=DHAN_ACCESS_TOKEN)
+        main(dhan_client)
